@@ -25,6 +25,13 @@ from .tools import (
     get_watchlist,
     search_symbols,
 )
+from .futures_tools import (
+    get_futures_positions,
+    get_futures_orders,
+    get_futures_quote,
+    get_futures_pnl,
+    get_futures_contract,
+)
 
 # Load environment variables
 load_dotenv()
@@ -33,7 +40,7 @@ load_dotenv()
 try:
     mcp = FastMCP(
         "robinhood-mcp",
-        description="Read-only research tools for Robinhood portfolio data",
+        description="Read-only research tools for Robinhood portfolio data (stocks, options, and futures)",
     )
 except TypeError:
     mcp = FastMCP("robinhood-mcp")
@@ -94,6 +101,11 @@ def _ensure_logged_in() -> None:
                 message = str(e)
                 print(f"[robinhood-mcp] Login failed: {e}", file=sys.stderr)
                 raise RobinhoodError(f"Not logged in: {message}") from e
+
+
+# ---------------------------------------------------------------------------
+# Stock / Portfolio tools (original)
+# ---------------------------------------------------------------------------
 
 
 @mcp.tool()
@@ -268,6 +280,86 @@ def robinhood_search_symbols(query: str) -> list:
     """
     _ensure_logged_in()
     return search_symbols(query)
+
+
+# ---------------------------------------------------------------------------
+# Futures tools (new)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def robinhood_get_futures_positions() -> list:
+    """Get current futures positions (derived from filled order history).
+
+    Since Robinhood's futures positions endpoint hasn't been publicly
+    discovered, this derives open positions by netting all filled buy
+    and sell orders per contract symbol.
+
+    Returns list of positions with symbol, side (long/short), quantity,
+    avg_entry_price, current_price, unrealized_pnl, multiplier, and fees.
+    """
+    _ensure_logged_in()
+    return get_futures_positions()
+
+
+@mcp.tool()
+def robinhood_get_futures_orders(order_state: str = "") -> list:
+    """Get futures order history with automatic pagination.
+
+    Args:
+        order_state: Filter by state (FILLED, CANCELLED, REJECTED, etc.).
+                     Empty string = all orders.
+
+    Returns list of order dicts with orderId, orderState, orderLegs,
+    quantity, averagePrice, realizedPnl, fees, and timestamps.
+    """
+    _ensure_logged_in()
+    state = order_state if order_state else None
+    return get_futures_orders(order_state=state)
+
+
+@mcp.tool()
+def robinhood_get_futures_quote(symbol: str) -> dict:
+    """Get real-time quote for a futures contract.
+
+    Args:
+        symbol: Futures symbol (e.g., 'ESM26', '/ESM26', 'NQM26', 'GCG26')
+
+    Returns quote data with bid/ask prices and sizes, last trade price,
+    market state, and update timestamp.
+    """
+    _ensure_logged_in()
+    return get_futures_quote(symbol)
+
+
+@mcp.tool()
+def robinhood_get_futures_pnl() -> dict:
+    """Get aggregate realized P&L from all futures trades.
+
+    Calculates total P&L from CLOSING orders only (to avoid double-counting).
+
+    Returns dict with total_pnl, total_pnl_without_fees, total_fees,
+    total_commissions, total_gold_savings, and num_closing_orders.
+    """
+    _ensure_logged_in()
+    return get_futures_pnl()
+
+
+@mcp.tool()
+def robinhood_get_futures_contract(symbol: str) -> dict:
+    """Get futures contract details by symbol.
+
+    Args:
+        symbol: Futures symbol (e.g., 'ESM26', '/ESM26')
+
+    Returns contract details including id, symbol, description,
+    multiplier, expiration, tradability, and state.
+    """
+    _ensure_logged_in()
+    result = get_futures_contract(symbol)
+    if result is None:
+        raise RobinhoodError(f"No futures contract found for symbol: {symbol}")
+    return result
 
 
 def main() -> None:
