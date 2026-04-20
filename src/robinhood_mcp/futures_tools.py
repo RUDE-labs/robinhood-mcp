@@ -5,9 +5,10 @@ Robinhood futures API directly using robin_stocks' session infrastructure.
 
 API endpoints discovered via robin_stocks PR #1641:
 - Contracts: api.robinhood.com/arsenal/v1/futures/contracts/symbol/{symbol}
+- Contract by ID: api.robinhood.com/arsenal/v1/futures/contracts/{id}
 - Quotes:    api.robinhood.com/marketdata/futures/quotes/v1/
 - Orders:    api.robinhood.com/ceres/v1/accounts/{account_id}/orders
-- Accounts:  api.robinhood.com/pathfinder/user_machine/ (account discovery)
+- Accounts:  api.robinhood.com/ceres/v1/accounts/
 
 Positions are DERIVED from filled order history since the positions
 endpoint hasn't been discovered yet.
@@ -47,6 +48,16 @@ def _extract_amount(field: Any) -> float:
     return 0.0
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Safely parse a value to float (handles strings, None, etc.)."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Futures account discovery
 # ---------------------------------------------------------------------------
@@ -65,7 +76,6 @@ def _get_futures_account_id() -> str:
 
     _update_session_for_futures()
 
-    # Try the ceres accounts endpoint first
     url = "https://api.robinhood.com/ceres/v1/accounts/"
     data = request_get(url)
 
@@ -87,8 +97,13 @@ def _get_futures_account_id() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Contract lookup
+# Contract lookup (by symbol and by ID)
 # ---------------------------------------------------------------------------
+
+# Cache: contractId -> contract details dict
+_contract_cache: dict[str, dict[str, Any]] = {}
+_contract_cache_lock = threading.Lock()
+
 
 def get_futures_contract(symbol: str) -> dict[str, Any] | None:
     """Get futures contract details by symbol (e.g., 'ESH26', '/ESH26')."""
@@ -98,8 +113,65 @@ def get_futures_contract(symbol: str) -> dict[str, Any] | None:
     data = request_get(url)
 
     if data and isinstance(data, dict) and "result" in data:
-        return data["result"]
+        result = data["result"]
+        # Cache by ID for later lookups
+        if isinstance(result, dict) and "id" in result:
+            with _contract_cache_lock:
+                _contract_cache[result["id"]] = result
+        return result
     return None
+
+
+def _get_contract_by_id(contract_id: str) -> dict[str, Any] | None:
+    """Get futures contract details by contract UUID.
+
+    Checks cache first, then hits the API.
+    """
+    with _contract_cache_lock:
+        if contract_id in _contract_cache:
+            return _contract_cache[contract_id]
+
+    url = f"https://api.robinhood.com/arsenal/v1/futures/contracts/{contract_id}"
+    _update_session_for_futures()
+    data = request_get(url)
+
+    result = None
+    if data and isinstance(data, dict):
+        # API may return the contract directly or wrapped in "result"
+        if "result" in data:
+            result = data["result"]
+        elif "id" in data:
+            result = data
+
+    if result and isinstance(result, dict):
+        with _contract_cache_lock:
+            _contract_cache[contract_id] = result
+        return result
+
+    return None
+
+
+def _resolve_contract_symbol(contract_id: str) -> str | None:
+    """Resolve a contractId UUID to a display symbol like '/MGCQ26'."""
+    contract = _get_contract_by_id(contract_id)
+    if not contract:
+        return None
+    # Try displaySymbol first (e.g., '/ESH26'), then symbol
+    return (
+        contract.get("displaySymbol")
+        or contract.get("symbol")
+        or contract.get("futuresSymbol")
+    )
+
+
+def _resolve_contract_multiplier(contract_id: str) -> float:
+    """Get the contract multiplier from contract details."""
+    contract = _get_contract_by_id(contract_id)
+    if contract and isinstance(contract, dict):
+        mult = contract.get("multiplier")
+        if mult:
+            return _safe_float(mult, 1.0)
+    return 1.0
 
 
 def _id_for_futures_contract(symbol: str) -> str | None:
@@ -128,6 +200,11 @@ def get_futures_quote(symbol: str) -> dict[str, Any]:
     if not contract_id:
         raise RobinhoodError(f"No futures contract found for symbol: {symbol}")
 
+    return _get_futures_quote_by_id(contract_id)
+
+
+def _get_futures_quote_by_id(contract_id: str) -> dict[str, Any]:
+    """Get real-time quote by contract ID."""
     url = "https://api.robinhood.com/marketdata/futures/quotes/v1/"
     payload = {"ids": contract_id}
     _update_session_for_futures()
@@ -140,7 +217,7 @@ def get_futures_quote(symbol: str) -> dict[str, Any]:
             if quote_data:
                 return quote_data
 
-    raise RobinhoodError(f"No quote data returned for futures symbol: {symbol}")
+    raise RobinhoodError(f"No quote data returned for contract ID: {contract_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -192,86 +269,63 @@ def get_futures_orders(
 # Derived positions from filled orders
 # ---------------------------------------------------------------------------
 
-def _parse_display_symbol(order: dict) -> str | None:
-    """Extract the display symbol (e.g., '/ESM26') from an order's legs."""
-    legs = order.get("orderLegs", [])
-    if not legs or not isinstance(legs, list):
-        return None
-    leg = legs[0]
-    if not isinstance(leg, dict):
-        return None
-    # Try multiple possible field names
-    return (
-        leg.get("displaySymbol")
-        or leg.get("futuresDisplaySymbol")
-        or leg.get("symbol")
-    )
-
-
-def _get_contract_multiplier(order: dict) -> float:
-    """Extract the contract multiplier from order leg metadata."""
-    legs = order.get("orderLegs", [])
-    if legs and isinstance(legs, list) and isinstance(legs[0], dict):
-        mult = legs[0].get("multiplier")
-        if mult:
-            try:
-                return float(mult)
-            except (TypeError, ValueError):
-                pass
-    # Common defaults
-    return 1.0
-
-
 def get_futures_positions() -> list[dict[str, Any]]:
     """Derive current open futures positions from filled order history.
 
-    Nets buy/sell quantities per contract symbol to determine open positions.
-    Calculates average entry price and attempts to fetch current quote for
-    unrealized P&L estimation.
+    Groups orders by contractId (UUID) from orderLegs, nets buy/sell
+    quantities to determine open positions. Resolves contractId to
+    human-readable symbol via contract API. Fetches live quotes for
+    unrealized P&L.
 
     Returns:
         List of position dicts with:
-        - symbol: Display symbol (e.g., '/ESM26')
+        - symbol: Display symbol (e.g., '/MGCQ26')
+        - contract_id: Robinhood contract UUID
         - side: 'long' or 'short'
         - quantity: Net open contracts (absolute value)
         - avg_entry_price: Weighted average fill price
         - current_price: Latest quote (if available)
         - unrealized_pnl: Estimated uPnL (if quote available)
         - multiplier: Contract multiplier
-        - total_fees: Fees paid on fills for this symbol
+        - total_fees: Fees paid on fills for this contract
     """
     filled_orders = get_futures_orders(order_state="FILLED")
 
     if not filled_orders:
         return []
 
-    # Group by symbol, track net position and avg entry
+    # Group by contractId from orderLegs[0]
     positions: dict[str, dict[str, Any]] = defaultdict(lambda: {
         "buy_qty": 0.0,
         "sell_qty": 0.0,
-        "buy_cost": 0.0,  # total $ spent on buys (qty * price)
-        "sell_cost": 0.0,  # total $ received on sells
+        "buy_cost": 0.0,
+        "sell_cost": 0.0,
         "total_fees": 0.0,
-        "multiplier": 1.0,
-        "raw_symbol": None,
     })
 
     for order in filled_orders:
-        symbol = _parse_display_symbol(order)
-        if not symbol:
+        legs = order.get("orderLegs")
+        if not legs or not isinstance(legs, list) or not isinstance(legs[0], dict):
             continue
 
-        # Clean symbol for grouping
-        clean_sym = symbol.upper().strip().lstrip("/")
+        leg = legs[0]
+        contract_id = leg.get("contractId")
+        if not contract_id:
+            continue
 
-        qty = float(order.get("filledQuantity", 0) or order.get("quantity", 0) or 0)
-        avg_price = float(order.get("averagePrice", 0) or 0)
-        position_effect = order.get("positionEffectAtPlacementTime", "")
-        side = order.get("side", "").upper()
+        # Side is in orderLegs[0].orderSide, NOT order.side
+        side = (leg.get("orderSide") or "").upper()
+        if side not in ("BUY", "SELL"):
+            continue
 
-        pos = positions[clean_sym]
-        pos["raw_symbol"] = symbol
-        pos["multiplier"] = _get_contract_multiplier(order)
+        # filledQuantity and averagePrice are strings
+        qty = _safe_float(order.get("filledQuantity") or order.get("quantity"))
+        avg_price = _safe_float(order.get("averagePrice") or leg.get("averagePrice"))
+
+        if qty <= 0:
+            continue
+
+        pos = positions[contract_id]
 
         # Accumulate fees
         fee = _extract_amount(order.get("totalFee", 0))
@@ -281,14 +335,14 @@ def get_futures_positions() -> list[dict[str, Any]]:
         if side == "BUY":
             pos["buy_qty"] += qty
             pos["buy_cost"] += qty * avg_price
-        elif side == "SELL":
+        else:
             pos["sell_qty"] += qty
             pos["sell_cost"] += qty * avg_price
 
-    # Build result — only include symbols with net open position
+    # Build result — only include contracts with net open position
     result: list[dict[str, Any]] = []
 
-    for clean_sym, pos in positions.items():
+    for contract_id, pos in positions.items():
         net_qty = pos["buy_qty"] - pos["sell_qty"]
 
         if abs(net_qty) < 0.0001:
@@ -297,23 +351,24 @@ def get_futures_positions() -> list[dict[str, Any]]:
         if net_qty > 0:
             side = "long"
             abs_qty = net_qty
-            # Avg entry for longs = total buy cost / buy qty
             avg_entry = pos["buy_cost"] / pos["buy_qty"] if pos["buy_qty"] > 0 else 0
         else:
             side = "short"
             abs_qty = abs(net_qty)
-            # Avg entry for shorts = total sell cost / sell qty
             avg_entry = pos["sell_cost"] / pos["sell_qty"] if pos["sell_qty"] > 0 else 0
+
+        # Resolve contractId to human-readable symbol
+        display_symbol = _resolve_contract_symbol(contract_id) or contract_id
+        multiplier = _resolve_contract_multiplier(contract_id)
 
         # Try to get current quote for uPnL
         current_price = None
         unrealized_pnl = None
         try:
-            quote = get_futures_quote(clean_sym)
+            quote = _get_futures_quote_by_id(contract_id)
             last_price = quote.get("last_trade_price") or quote.get("mark_price")
             if last_price:
-                current_price = float(last_price)
-                multiplier = pos["multiplier"]
+                current_price = _safe_float(last_price)
                 if side == "long":
                     unrealized_pnl = (current_price - avg_entry) * abs_qty * multiplier
                 else:
@@ -322,13 +377,14 @@ def get_futures_positions() -> list[dict[str, Any]]:
             pass  # Quote unavailable — still return position without uPnL
 
         result.append({
-            "symbol": pos["raw_symbol"] or f"/{clean_sym}",
+            "symbol": display_symbol,
+            "contract_id": contract_id,
             "side": side,
             "quantity": abs_qty,
             "avg_entry_price": round(avg_entry, 4),
             "current_price": current_price,
             "unrealized_pnl": round(unrealized_pnl, 2) if unrealized_pnl is not None else None,
-            "multiplier": pos["multiplier"],
+            "multiplier": multiplier,
             "total_fees": round(pos["total_fees"], 2),
         })
 
